@@ -728,13 +728,13 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Loop", "Repeats the song until you stop it."},
     {"Sound Volume", "Quiet, medium or loud (for you; others hear it at full)."},
     {"Rescan Songs", "Looks in the sounds folder again."},
-    {"Effects", "Weather, disco and time of day. Others with ClientDaBell see them too."},
-    {"Morning", "Low sun, warm light and a little mist. The whole room (with ClientDaBell) gets it."},
-    {"Afternoon", "High sun and a bright blue sky. The whole room (with ClientDaBell) gets it."},
-    {"Sunset", "An orange sky with the sun on the horizon. The whole room (with ClientDaBell) gets it."},
-    {"Night", "Dark sky, moon and stars. The whole room (with ClientDaBell) gets it."},
+    {"Effects", "Weather and disco (others with ClientDaBell see them) and time of day (only you)."},
+    {"Morning", "Low sun, warm light and a little mist. Only you see it."},
+    {"Afternoon", "High sun and a bright blue sky. Only you see it."},
+    {"Sunset", "An orange sky with the sun on the horizon. Only you see it."},
+    {"Night", "Dark sky, moon and stars. Only you see it."},
     {"Disco", "A spinning disco ball with colored beams, lights and sparkles."},
-    {"Room Effects", "On: effects and time of day are set for the whole room (ClientDaBell users). Off: only you."},
+    {"Room Effects", "On: weather and disco are set for the whole room (ClientDaBell users). Off: only you. Time of day is always just yours."},
     {"Snow", "Snow for the whole room: everyone with ClientDaBell sees it, even people who join later."},
     {"Rain", "Rain falls around you."},
     {"Thunderstorm", "Rain with lightning and thunder."},
@@ -2654,17 +2654,17 @@ static void WeatherReset() {                                   // room change: t
 }
 
 // ---- room effects sync ------------------------------------------------------------
-// The weather and the time of day live on the Photon room (room custom properties), so the
-// room's state is kept by Photon's server: everyone with ClientDaBell in the room sees the
-// same snow and the same time of day, people who join later get it straight away, and it
+// The weather lives on the Photon room (room custom properties), so the room's state is
+// kept by Photon's server: everyone with ClientDaBell in the room sees the same snow,
+// rain, storm or disco, people who join later get it straight away, and it
 // stays after the person who turned it on leaves. Anyone with ClientDaBell can change or
 // turn it off; the last change wins, and your menu buttons follow the room.
 //   "cdbWx"    1 + effect * 3 + intensity   (effect 0 snow, 1 rain, 2 storm, 3 disco; 0 / missing = off)
-//   "cdbTod"   1 + time of day              (0 morning, 1 afternoon, 2 sunset, 3 night)
-//   "cdbWxBy", "cdbTodBy"  the name of who changed it last (for the notification)
+//   "cdbWxBy"  the name of who changed it last (for the notification)
+// The time of day is NOT shared: it only changes your own game.
 // Players without the menu get the properties too but the game ignores them, so they see
 // nothing. If this game build has no room calls, the older per-player properties are used.
-static const char *kWxKey = "cdbWx", *kTodKey = "cdbTod", *kWxByKey = "cdbWxBy", *kTodByKey = "cdbTodBy";
+static const char *kWxKey = "cdbWx", *kWxByKey = "cdbWxBy";
 static const char *kTodNames[] = {"morning", "afternoon", "sunset", "night"};
 static const char *kWxNames[] = {"snow", "rain", "a thunderstorm", "a disco"};
 static int g_wxSent = -1, g_roomWx = -1, g_roomWxInt = 1, g_todSent = -1, g_roomTod = -1;
@@ -2681,12 +2681,6 @@ static void AdoptWx(int v) {                    // make your menu match the room
     for (int i = 0; i < 4; i++) g_wxSel[i] = (i == e);
     g_wx = e;
     if (v) g_wxIntensity = (v - 1) % 3;
-    g_dirty = true;
-}
-static void AdoptTod(int v) {
-    int t = v ? v - 1 : -1;
-    for (int i = 0; i < 4; i++) g_todSel[i] = (i == t);
-    g_tod = t;
     g_dirty = true;
 }
 static std::string MyNick() {
@@ -2790,7 +2784,7 @@ static void RoomPropsTick() {
     if (!room) return;                                  // not in a Photon room yet
     Il2CppObject *props = G.roomGetProps[room]();
     SyncChannel(g_chWx, room, props, kWxKey, kWxByKey, 12, MyWxValue(), AdoptWx, true);
-    SyncChannel(g_chTod, room, props, kTodKey, kTodByKey, 4, MyTodValue(), AdoptTod, false);
+    // Time of day is not synced: it only changes your own game.
 }
 
 // --- per-player properties (only if the room calls are missing) ---
@@ -2809,12 +2803,12 @@ static void PlayerPropsTick() {
     if ((mine != g_wxSent || myTod != g_todSent) && g_time >= g_nextWxSend) {
         g_nextWxSend = g_time + 0.5;
         if (mine != g_wxSent && SendProp(kWxKey, mine)) g_wxSent = mine;
-        if (myTod != g_todSent && SendProp(kTodKey, myTod)) g_todSent = myTod;
+        g_todSent = myTod;                       // time of day stays on your game only
     }
     if (g_time < g_nextWxRead) return;
     g_nextWxRead = g_time + 1.0;
-    int found = 0, foundTod = 0;
-    std::string nick, todNick;
+    int found = 0;
+    std::string nick;
     if (G.pnOthers.IsValid() && G.plGetProps.IsValid() && G.htGet.IsValid()) {
         auto *arr = (uint8_t *)G.pnOthers();
         uintptr_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
@@ -2823,12 +2817,11 @@ static void PlayerPropsTick() {
             std::string n = s ? s->str() : "";
             return n.empty() ? std::string("Someone") : n;
         };
-        for (uintptr_t i = 0; i < n && i < 64 && !(found && foundTod); i++) {   // the first player with each one
+        for (uintptr_t i = 0; i < n && i < 64 && !found; i++) {   // the first player with weather on
             Il2CppObject *pl = ((Il2CppObject **)(arr + 0x20))[i];
             if (!pl) continue;
             Il2CppObject *props = G.plGetProps[pl]();
             if (!found && (found = TableInt(props, kWxKey, 12))) nick = NickOf(pl);
-            if (!foundTod && (foundTod = TableInt(props, kTodKey, 4))) todNick = NickOf(pl);
         }
     }
     int mode = found ? (found - 1) / 3 : -1;
@@ -2836,10 +2829,7 @@ static void PlayerPropsTick() {
         Notify("%s started %s", nick.c_str(), kWxNames[mode]);
     g_roomWx = mode;
     g_roomWxInt = found ? (found - 1) % 3 : 1;
-    int tod = foundTod ? foundTod - 1 : -1;
-    if (tod != g_roomTod && tod >= 0 && !(g_tod >= 0 && g_todSel[g_tod]))
-        Notify("%s set the time to %s", todNick.c_str(), kTodNames[tod]);
-    g_roomTod = tod;
+    g_roomTod = -1;
 }
 
 static void RoomWxTick() {
@@ -2848,7 +2838,7 @@ static void RoomWxTick() {
         g_shareWas = f_wxShare;
         g_chWx = SyncChan(); g_chTod = SyncChan();
         g_wxSent = g_todSent = -1; g_roomWx = g_roomTod = -1;
-        if (!f_wxShare && !RoomSyncAvailable()) { SendProp(kWxKey, 0); SendProp(kTodKey, 0); }
+        if (!f_wxShare && !RoomSyncAvailable()) SendProp(kWxKey, 0);
     }
     if (!f_wxShare) return;                            // Room Effects off: only you see yours
     try {
@@ -2944,9 +2934,9 @@ static void WeatherTick(float dt) {
 //   - a color filter: a small sphere around your eyes that multiplies everything you see by
 //     a color (darker and bluer at night, orange at sunset). It only draws if the shader
 //     takes a blend mode, so it can never black out your view.
-// The scene's light, ambient and fog are changed too where the map uses them. Your pick is
-// stored on the room like the weather (see RoomWxTick), so every ClientDaBell user sees the
-// same time of day. The game's own values are saved the first time and put back after.
+// The scene's light, ambient and fog are changed too where the map uses them. Your pick only
+// changes your own game: it is not sent to the room. The game's own values are saved the
+// first time and put back after.
 struct TodPreset {
     float az, el;                 // where the sun (or moon) is, in degrees
     Color light; float lightI;    // the scene's directional lights
