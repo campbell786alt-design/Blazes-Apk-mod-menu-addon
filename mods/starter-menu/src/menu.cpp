@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v1.2.4 Dev 2"
+#define CDB_VERSION "v1.2.5"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -43,6 +43,20 @@ static MethodBase Overload(Class c, const char *name, std::vector<std::string> t
         bool ok = true;
         for (size_t i = 0; i < types.size() && ok; i++) ok = TypeName(mi->parameters[i]) == types[i];
         if (ok) return m;
+    }
+    return {};
+}
+// Find a method by name and argument count on a class or any class above it
+// (Photon's Room keeps CustomProperties on its parent, RoomInfo). argc -1 = any.
+static MethodBase FindUp(Class c, const char *name, int argc) {
+    for (int depth = 0; c.IsValid() && c.GetClass() && depth < 8; depth++) {
+        for (auto &m : c.GetMethods(false)) {
+            auto *mi = m.GetInfo();
+            if (mi && mi->name && strcmp(mi->name, name) == 0 && (argc < 0 || mi->parameters_count == argc)) return m;
+        }
+        auto *parent = c.GetClass()->parent;
+        if (!parent) break;
+        c = Class(&parent->byval_arg);
     }
     return {};
 }
@@ -91,6 +105,7 @@ static struct {
     Method<Il2CppObject *> audioClipCreate;           // soundboard
     Method<bool> audioClipSetData;
     Method<void> asSetClip, asSetVolume, asSetSpatial, asSetLoop, asPlay, asStop;
+    Method<bool> asIsPlaying;
     BNM::MonoType *tAudioSource = nullptr;
     // Soundboard through voice chat: Photon Voice's Recorder (the thing that sends your mic)
     BNM::MonoType *tRecorder = nullptr;
@@ -111,6 +126,17 @@ static struct {
     Method<void> itemDrop, setHeldItem;
     void *(*arrayNew)(void *, uintptr_t) = nullptr;
     void *(*valueBox)(void *, void *) = nullptr;
+    // Room effects: the weather and time of day are kept on the Photon room itself (room
+    // custom properties). Photon's server stores them for the room and sends them to every
+    // client, including people who join later. ClientDaBell reads them; the game ignores them.
+    // If the room calls are missing, the older per-player properties are used instead.
+    BNM::IL2CPP::Il2CppClass *intClass = nullptr;
+    Method<Il2CppObject *> pnLocalPlayer, pnOthers, plGetProps, htGet, pnCurrentRoom, roomGetProps;
+    Method<BNM::Structures::Mono::String *> plGetNick;
+    Method<void> htSet;
+    MethodBase plSetProps, roomSetProps;
+    int plSetPropsArgs = 0, roomSetPropsArgs = 0;
+    Class htClass;
     Method<bool> behaviourGetEnabled;
     Method<void> behaviourSetEnabled;
     std::vector<BNM::MonoType *> trackerTypes;
@@ -167,6 +193,7 @@ static bool Lookups() {
             G.asSetLoop = asrc.GetMethod("set_loop", 1);
             G.asPlay = asrc.GetMethod("Play", 0);
             G.asStop = asrc.GetMethod("Stop", 0);
+            G.asIsPlaying = asrc.GetMethod("get_isPlaying", 0);
         }
         Class rec("Photon.Voice.Unity", "Recorder");
         if (rec.IsValid()) {
@@ -300,6 +327,48 @@ static bool Lookups() {
         G.valueBox = (decltype(G.valueBox))ym::api()->resolve("il2cpp_value_box");
         ym::log("clientdabell: items rpc=%d pv=%d item=%d box=%d", G.rpcCreateItem != nullptr, G.pvRpc.IsValid(),
                 G.itemKey.IsValid(), G.arrayNew && G.valueBox);
+    }
+    {   // room effects (see RoomWxTick)
+        G.intClass = Class("System", "Int32").GetClass();
+        Class pn("Photon.Pun", "PhotonNetwork"), pl("Photon.Realtime", "Player"), ht("ExitGames.Client.Photon", "Hashtable");
+        if (pn.IsValid()) {
+            G.pnLocalPlayer = pn.GetMethod("get_LocalPlayer", 0);
+            G.pnOthers = pn.GetMethod("get_PlayerListOthers", 0);
+        }
+        if (pl.IsValid()) {
+            G.plGetProps = pl.GetMethod("get_CustomProperties", 0);
+            G.plGetNick = pl.GetMethod("get_NickName", 0);
+            for (auto &m : pl.GetMethods(false)) {                    // SetCustomProperties(Hashtable[, expected, webFlags])
+                auto *mi = m.GetInfo();
+                if (!mi || !mi->name || strcmp(mi->name, "SetCustomProperties") != 0) continue;
+                if (mi->parameters_count == 1 || mi->parameters_count == 3) { G.plSetProps = m; G.plSetPropsArgs = mi->parameters_count; }
+            }
+        }
+        if (ht.IsValid()) {
+            G.htClass = ht;
+            // Photon's Hashtable has this[object] (and in some versions this[byte]); look up
+            // through the parent classes too, in case it only inherits the indexer.
+            for (Class c = ht; c.IsValid() && c.GetClass(); ) {
+                if (!G.htSet.IsValid()) G.htSet = Overload(c, "set_Item", {"System.Object", "System.Object"});
+                if (!G.htGet.IsValid()) G.htGet = Overload(c, "get_Item", {"System.Object"});
+                auto *parent = c.GetClass()->parent;
+                if (!parent || (G.htSet.IsValid() && G.htGet.IsValid())) break;
+                c = Class(&parent->byval_arg);
+            }
+        }
+        Class room("Photon.Realtime", "Room");
+        if (pn.IsValid()) G.pnCurrentRoom = pn.GetMethod("get_CurrentRoom", 0);
+        if (room.IsValid()) {
+            G.roomGetProps = FindUp(room, "get_CustomProperties", 0);
+            for (int argc : {3, 1, 2}) {                              // SetCustomProperties(Hashtable[, expected[, webFlags]])
+                MethodBase s = FindUp(room, "SetCustomProperties", argc);
+                if (s.IsValid()) { G.roomSetProps = s; G.roomSetPropsArgs = argc; break; }
+            }
+        }
+        ym::log("clientdabell: room effects local=%d others=%d props=%d/%d(%d) table=%d/%d room=%d/%d/%d(%d)", G.pnLocalPlayer.IsValid(),
+                G.pnOthers.IsValid(), G.plGetProps.IsValid(), G.plSetProps.IsValid(), G.plSetPropsArgs,
+                G.htSet.IsValid(), G.htGet.IsValid(), G.pnCurrentRoom.IsValid(), G.roomGetProps.IsValid(),
+                G.roomSetProps.IsValid(), G.roomSetPropsArgs);
     }
     Class behaviour("UnityEngine", "Behaviour");
     G.behaviourGetEnabled = behaviour.GetMethod("get_enabled", 0);
@@ -446,6 +515,7 @@ static bool g_wxSel[4];             // Effects: Snow, Rain, Thunderstorm, Disco 
 static int g_wx = -1;
 static bool g_todSel[4];            // Effects: Morning, Afternoon, Sunset, Night (pick one)
 static int g_tod = -1;
+static bool f_wxShare = true;      // Effects: send yours to the room and see theirs (ClientDaBell users)
 static int g_dance = -1;            // the picked dance, -1 = none
 static bool f_fly, f_fastFly, f_platforms, f_lowGravity, f_rainbow, f_fps, f_clock, f_rightHand,
             f_notify = true;
@@ -576,6 +646,7 @@ static Item g_items[] = {
     {EFFECTS, "Afternoon", TOGGLE, MAIN, &g_todSel[1], TodPicked},
     {EFFECTS, "Sunset", TOGGLE, MAIN, &g_todSel[2], TodPicked},
     {EFFECTS, "Night", TOGGLE, MAIN, &g_todSel[3], TodPicked},
+    {EFFECTS, "Room Effects", TOGGLE, MAIN, &f_wxShare},
 
     {OVERPOWERED, "Exit Overpowered", OPEN, MAIN},
     {OVERPOWERED, "Long Arms", TOGGLE, MAIN, &f_longArms, LongArmsToggled},
@@ -650,20 +721,21 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Spaz", "Hands shake all over the place. Hold left trigger."},
     {"Beyblade", "Hands spin fast around your waist. Hold left trigger."},
     {"Soundboard", "Plays .wav songs from the sounds folder, through your voice chat."},
-    {"Others Hear It", "On: the room hears the song through your mic. Off: only you hear it."},
+    {"Others Hear It", "On: the room hears the song through your mic. Off: only you hear it. Turning it back on restarts the song for the room."},
     {"Next Song", "Picks the next song in the list."},
     {"Previous Song", "Picks the previous song in the list."},
     {"Stop Sound", "Stops the song (and cancels a loading one)."},
     {"Loop", "Repeats the song until you stop it."},
     {"Sound Volume", "Quiet, medium or loud (for you; others hear it at full)."},
     {"Rescan Songs", "Looks in the sounds folder again."},
-    {"Effects", "Weather, disco and time of day. Only you see and hear them."},
-    {"Morning", "Low sun, soft warm light and a little mist."},
-    {"Afternoon", "High sun and a bright blue sky."},
-    {"Sunset", "An orange sky with the sun on the horizon."},
-    {"Night", "Dark sky, moon and stars."},
+    {"Effects", "Weather, disco and time of day. Others with ClientDaBell see them too."},
+    {"Morning", "Low sun, warm light and a little mist. The whole room (with ClientDaBell) gets it."},
+    {"Afternoon", "High sun and a bright blue sky. The whole room (with ClientDaBell) gets it."},
+    {"Sunset", "An orange sky with the sun on the horizon. The whole room (with ClientDaBell) gets it."},
+    {"Night", "Dark sky, moon and stars. The whole room (with ClientDaBell) gets it."},
     {"Disco", "A spinning disco ball with colored beams, lights and sparkles."},
-    {"Snow", "Snow falls around you."},
+    {"Room Effects", "On: effects and time of day are set for the whole room (ClientDaBell users). Off: only you."},
+    {"Snow", "Snow for the whole room: everyone with ClientDaBell sees it, even people who join later."},
     {"Rain", "Rain falls around you."},
     {"Thunderstorm", "Rain with lightning and thunder."},
     {"Effect Intensity", "Light, medium or heavy."},
@@ -742,7 +814,7 @@ static void BuildView() {
     g_view.clear();
     if (g_cat == ENABLED) {
         g_view.push_back(&g_returnItem);
-        for (auto &it : g_items) if (it.kind == TOGGLE && *it.flag && it.flag != &f_notify && it.flag != &f_soundMic) g_view.push_back(&it);
+        for (auto &it : g_items) if (it.kind == TOGGLE && *it.flag && it.flag != &f_notify && it.flag != &f_soundMic && it.flag != &f_wxShare) g_view.push_back(&it);
     } else {
         for (auto &it : g_items) if (it.cat == g_cat) g_view.push_back(&it);
     }
@@ -1186,7 +1258,7 @@ static int g_ironSpeed = 0;
 static void NextIronSpeed() { g_ironSpeed = (g_ironSpeed + 1) % 4; Notify("Iron Man speed: %d", (int)kIronSpeeds[g_ironSpeed]); }
 static void NextTheme() { g_theme = (g_theme + 1) % kThemeCount; Notify("Theme: %s", T().name); }
 static void AllOff() {
-    for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify && it.flag != &f_soundMic) *it.flag = false;   // ticks undo each mod
+    for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify && it.flag != &f_soundMic && it.flag != &f_wxShare) *it.flag = false;   // ticks undo each mod
     g_dance = -1;
     g_dupeArmed = 0;
     g_wx = -1;
@@ -2085,9 +2157,31 @@ static void SoundTick() {
     try { MicApply(r, clip); } catch (...) {}
     g_micCheckAt = g_time + 0.75;
 }
+static bool g_songPlaying = false;              // a song was started and not stopped
+static double g_songEnd = 0;                    // when it ends if it isn't looping
+static bool SongStillPlaying() {
+    Il2CppObject *src = g_audioSrc.get();
+    if (!g_songPlaying || g_clipSong < 0 || g_load.f || !Alive(src) || !Alive(g_clip.get())) return false;
+    if (G.asIsPlaying.IsValid()) return G.asIsPlaying[src]();
+    return f_soundLoop || g_time < g_songEnd;
+}
 static void SoundMicToggled() {
-    if (!f_soundMic) MicStop();
-    Notify(f_soundMic ? "Soundboard: the room hears it" : "Soundboard: only you hear it");
+    if (!f_soundMic) {
+        MicStop();
+        Notify("Soundboard: only you hear it");
+        return;
+    }
+    // Turned back on while a song plays: hand it to voice chat again. Voice chat can only
+    // play the clip from the start, so the song restarts for you too and you both hear the same.
+    if (SongStillPlaying()) {
+        Il2CppObject *src = g_audioSrc.get();
+        G.asPlay[src]();                            // Play() starts the clip over
+        g_songEnd = g_time + g_clipLen;
+        bool room = MicStart();
+        Notify(room ? "Soundboard: the room hears it (song restarted)" : "Soundboard: voice chat not found, only you hear it");
+        return;
+    }
+    Notify("Soundboard: the room hears it");
 }
 
 static void PlayLoaded() {
@@ -2098,6 +2192,8 @@ static void PlayLoaded() {
     if (G.asSetSpatial.IsValid()) G.asSetSpatial[src](0.0f);          // 2D: heard in your head, wherever you walk
     if (G.asSetLoop.IsValid()) G.asSetLoop[src](f_soundLoop);
     G.asPlay[src]();
+    g_songPlaying = true;
+    g_songEnd = g_time + g_clipLen;
     bool room = MicStart();
     Notify(room ? "Playing %.30s (room hears it)" : f_soundMic ? "Playing %.30s (voice chat not found, only you)" : "Playing %.30s",
            SongTitle(g_clipSong).c_str());
@@ -2220,6 +2316,7 @@ static void StopSound() {
     if (g_clipSong < 0 && Alive(g_clip.get())) { G.destroy(g_clip.get()); g_clip.clear(); }   // a half-loaded clip is useless
     Il2CppObject *src = g_audioSrc.get();
     if (Alive(src) && G.asStop.IsValid()) G.asStop[src]();
+    g_songPlaying = false;
     MicStop();
 }
 static void ApplyLoop() {
@@ -2239,8 +2336,11 @@ static void NextSoundVolume() {
     Notify("Sound volume: %s", kSoundVolNames[g_soundVol]);
 }
 
-// ---- effects: snow, rain, thunderstorm, disco (only you see and hear them) -----------
-// Nothing here is sent to anyone. A fixed pool of small cubes (kMaxFx) falls around your
+// ---- effects: snow, rain, thunderstorm (shared with ClientDaBell users) -------------
+// The effect itself is drawn on each client: only a small number (which effect, how heavy)
+// is stored on the Photon room, server side (see RoomWxTick). Every ClientDaBell user in the
+// room reads it and runs the same effect around themselves; players without the menu
+// receive the property but the game ignores it, so they see nothing. A fixed pool of small cubes (kMaxFx) falls around your
 // head and is reused: a piece that lands, or drifts too far away, restarts above you. The
 // pool is made a few pieces per frame, once, and is hidden (not destroyed) when you switch
 // the effect off. A thunderstorm adds a lightning bolt far away in the sky, a brief
@@ -2553,9 +2653,225 @@ static void WeatherReset() {                                   // room change: t
     g_wxOn = false;
 }
 
+// ---- room effects sync ------------------------------------------------------------
+// The weather and the time of day live on the Photon room (room custom properties), so the
+// room's state is kept by Photon's server: everyone with ClientDaBell in the room sees the
+// same snow and the same time of day, people who join later get it straight away, and it
+// stays after the person who turned it on leaves. Anyone with ClientDaBell can change or
+// turn it off; the last change wins, and your menu buttons follow the room.
+//   "cdbWx"    1 + effect * 3 + intensity   (effect 0 snow, 1 rain, 2 storm, 3 disco; 0 / missing = off)
+//   "cdbTod"   1 + time of day              (0 morning, 1 afternoon, 2 sunset, 3 night)
+//   "cdbWxBy", "cdbTodBy"  the name of who changed it last (for the notification)
+// Players without the menu get the properties too but the game ignores them, so they see
+// nothing. If this game build has no room calls, the older per-player properties are used.
+static const char *kWxKey = "cdbWx", *kTodKey = "cdbTod", *kWxByKey = "cdbWxBy", *kTodByKey = "cdbTodBy";
+static const char *kTodNames[] = {"morning", "afternoon", "sunset", "night"};
+static const char *kWxNames[] = {"snow", "rain", "a thunderstorm", "a disco"};
+static int g_wxSent = -1, g_roomWx = -1, g_roomWxInt = 1, g_todSent = -1, g_roomTod = -1;
+static double g_nextWxSend = 0, g_nextWxRead = 0;
+static bool g_wxSyncBroken = false, g_shareWas = true;
+
+static int MyWxValue() {
+    if (g_wx < 0 || !g_wxSel[g_wx]) return 0;
+    return 1 + g_wx * 3 + g_wxIntensity;
+}
+static int MyTodValue() { return g_tod >= 0 && g_todSel[g_tod] ? 1 + g_tod : 0; }
+static void AdoptWx(int v) {                    // make your menu match the room
+    int e = v ? (v - 1) / 3 : -1;
+    for (int i = 0; i < 4; i++) g_wxSel[i] = (i == e);
+    g_wx = e;
+    if (v) g_wxIntensity = (v - 1) % 3;
+    g_dirty = true;
+}
+static void AdoptTod(int v) {
+    int t = v ? v - 1 : -1;
+    for (int i = 0; i < 4; i++) g_todSel[i] = (i == t);
+    g_tod = t;
+    g_dirty = true;
+}
+static std::string MyNick() {
+    Il2CppObject *me = G.pnLocalPlayer.IsValid() ? G.pnLocalPlayer() : nullptr;
+    auto *s = me && G.plGetNick.IsValid() ? G.plGetNick[me]() : nullptr;
+    std::string n = s ? s->str() : "";
+    return n.empty() ? std::string("Someone") : n;
+}
+
+static Il2CppObject *NewTable() {
+    if (!G.htSet.IsValid() || !G.htClass.IsValid() || !G.valueBox || !G.intClass) return nullptr;
+    return G.htClass.CreateNewObjectParameters();
+}
+static void PutInt(Il2CppObject *table, const char *key, int v) {
+    // null removes the property for everyone, so nothing is left behind when it is switched off
+    void *boxed = v ? G.valueBox(G.intClass, &v) : nullptr;
+    G.htSet[table]((Il2CppObject *)CreateMonoString(key), (Il2CppObject *)boxed);
+}
+static void PutStr(Il2CppObject *table, const char *key, const std::string &s) {
+    G.htSet[table]((Il2CppObject *)CreateMonoString(key), (Il2CppObject *)CreateMonoString(s.c_str()));
+}
+static int TableInt(Il2CppObject *props, const char *key, int max) {
+    if (!props) return 0;
+    auto *o = (Il2CppObject *)G.htGet[props]((Il2CppObject *)CreateMonoString(key));
+    if (!o || o->klass != G.intClass) return 0;
+    int v = *(int *)((uint8_t *)o + sizeof(Il2CppObject));
+    return v >= 1 && v <= max ? v : 0;
+}
+static std::string TableStr(Il2CppObject *props, const char *key) {
+    if (!props) return "";
+    auto *o = (Il2CppObject *)G.htGet[props]((Il2CppObject *)CreateMonoString(key));
+    if (!o || o->klass != G.stringClass) return "";
+    return ((BNM::Structures::Mono::String *)o)->str();
+}
+
+// --- room properties (the normal path) ---
+static bool RoomSyncAvailable() {
+    return G.pnCurrentRoom.IsValid() && G.roomGetProps.IsValid() && G.roomSetProps.IsValid() &&
+           G.htGet.IsValid() && G.htSet.IsValid();
+}
+static bool SendRoomProp(Il2CppObject *room, const char *key, const char *byKey, int v) {
+    Il2CppObject *table = NewTable();
+    if (!room || !table) return false;
+    PutInt(table, key, v);
+    PutStr(table, byKey, MyNick());
+    if (G.roomSetPropsArgs == 3) { Method<bool> set = G.roomSetProps; set[room](table, (Il2CppObject *)nullptr, (Il2CppObject *)nullptr); }
+    else if (G.roomSetPropsArgs == 2) { Method<bool> set = G.roomSetProps; set[room](table, (Il2CppObject *)nullptr); }
+    else { Method<bool> set = G.roomSetProps; set[room](table); }
+    return true;
+}
+// One shared value (weather or time of day). sent: what we last sent or took from the room
+// (-1 = not known yet in this room). seen: the last room value we reacted to. After we send,
+// Photon updates our copy of the room only when the server answers, so for a few seconds
+// the old value is ignored (unless the room already shows ours).
+struct SyncChan { int sent = -1, seen = -1; double holdUntil = 0, nextSend = 0; };
+static SyncChan g_chWx, g_chTod;
+
+static void SyncChannel(SyncChan &ch, Il2CppObject *room, Il2CppObject *props, const char *key, const char *byKey,
+                        int max, int mine, void (*adopt)(int), bool isWx) {
+    int roomV = TableInt(props, key, max);
+    if (ch.sent < 0) {                                 // just joined (or turned sharing on): the room wins
+        if (roomV && roomV != mine) {
+            adopt(roomV);
+            std::string by = TableStr(props, byKey);
+            if (by.empty()) by = "The room";
+            if (isWx) Notify("%s has %s on", by.c_str(), kWxNames[(roomV - 1) / 3]);
+            else Notify("%s set the time to %s", by.c_str(), kTodNames[roomV - 1]);
+            mine = roomV;
+        }
+        ch.sent = roomV;                               // if the room had nothing and you have something, it goes out next
+        ch.seen = roomV;
+    }
+    if (mine != ch.sent) {
+        if (g_time >= ch.nextSend && SendRoomProp(room, key, byKey, mine)) {
+            ch.sent = mine;
+            ch.holdUntil = g_time + 3.0;
+            ch.nextSend = g_time + 0.5;
+        }
+        return;
+    }
+    if (roomV == ch.seen) return;
+    if (g_time < ch.holdUntil && roomV != ch.sent) return;   // still the old value: wait for the server
+    ch.seen = roomV;
+    if (roomV == mine) return;
+    adopt(roomV);                                       // someone else changed it
+    ch.sent = roomV;
+    std::string by = TableStr(props, byKey);
+    if (by.empty()) by = "Someone";
+    if (isWx) {
+        if (roomV) Notify("%s turned on %s", by.c_str(), kWxNames[(roomV - 1) / 3]);
+        else Notify("%s turned the effects off", by.c_str());
+    } else {
+        if (roomV) Notify("%s set the time to %s", by.c_str(), kTodNames[roomV - 1]);
+        else Notify("%s turned the time of day off", by.c_str());
+    }
+}
+static void RoomPropsTick() {
+    if (g_time < g_nextWxRead) return;
+    g_nextWxRead = g_time + 0.25;
+    Il2CppObject *room = G.pnCurrentRoom();
+    if (!room) return;                                  // not in a Photon room yet
+    Il2CppObject *props = G.roomGetProps[room]();
+    SyncChannel(g_chWx, room, props, kWxKey, kWxByKey, 12, MyWxValue(), AdoptWx, true);
+    SyncChannel(g_chTod, room, props, kTodKey, kTodByKey, 4, MyTodValue(), AdoptTod, false);
+}
+
+// --- per-player properties (only if the room calls are missing) ---
+static bool SendProp(const char *key, int v) {
+    Il2CppObject *me = G.pnLocalPlayer.IsValid() ? G.pnLocalPlayer() : nullptr;
+    Il2CppObject *table = NewTable();
+    if (!me || !G.plSetProps.IsValid() || !table) return false;
+    PutInt(table, key, v);
+    Method<bool> set = G.plSetProps;
+    if (G.plSetPropsArgs == 3) set[me](table, (Il2CppObject *)nullptr, (Il2CppObject *)nullptr);
+    else set[me](table);
+    return true;
+}
+static void PlayerPropsTick() {
+    int mine = MyWxValue(), myTod = MyTodValue();
+    if ((mine != g_wxSent || myTod != g_todSent) && g_time >= g_nextWxSend) {
+        g_nextWxSend = g_time + 0.5;
+        if (mine != g_wxSent && SendProp(kWxKey, mine)) g_wxSent = mine;
+        if (myTod != g_todSent && SendProp(kTodKey, myTod)) g_todSent = myTod;
+    }
+    if (g_time < g_nextWxRead) return;
+    g_nextWxRead = g_time + 1.0;
+    int found = 0, foundTod = 0;
+    std::string nick, todNick;
+    if (G.pnOthers.IsValid() && G.plGetProps.IsValid() && G.htGet.IsValid()) {
+        auto *arr = (uint8_t *)G.pnOthers();
+        uintptr_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+        auto NickOf = [](Il2CppObject *pl) {
+            auto *s = G.plGetNick.IsValid() ? G.plGetNick[pl]() : nullptr;
+            std::string n = s ? s->str() : "";
+            return n.empty() ? std::string("Someone") : n;
+        };
+        for (uintptr_t i = 0; i < n && i < 64 && !(found && foundTod); i++) {   // the first player with each one
+            Il2CppObject *pl = ((Il2CppObject **)(arr + 0x20))[i];
+            if (!pl) continue;
+            Il2CppObject *props = G.plGetProps[pl]();
+            if (!found && (found = TableInt(props, kWxKey, 12))) nick = NickOf(pl);
+            if (!foundTod && (foundTod = TableInt(props, kTodKey, 4))) todNick = NickOf(pl);
+        }
+    }
+    int mode = found ? (found - 1) / 3 : -1;
+    if (mode != g_roomWx && mode >= 0 && !(g_wx >= 0 && g_wxSel[g_wx]))
+        Notify("%s started %s", nick.c_str(), kWxNames[mode]);
+    g_roomWx = mode;
+    g_roomWxInt = found ? (found - 1) % 3 : 1;
+    int tod = foundTod ? foundTod - 1 : -1;
+    if (tod != g_roomTod && tod >= 0 && !(g_tod >= 0 && g_todSel[g_tod]))
+        Notify("%s set the time to %s", todNick.c_str(), kTodNames[tod]);
+    g_roomTod = tod;
+}
+
+static void RoomWxTick() {
+    if (g_wxSyncBroken) return;
+    if (f_wxShare != g_shareWas) {                      // sharing switched: start over (the room wins when it comes back on)
+        g_shareWas = f_wxShare;
+        g_chWx = SyncChan(); g_chTod = SyncChan();
+        g_wxSent = g_todSent = -1; g_roomWx = g_roomTod = -1;
+        if (!f_wxShare && !RoomSyncAvailable()) { SendProp(kWxKey, 0); SendProp(kTodKey, 0); }
+    }
+    if (!f_wxShare) return;                            // Room Effects off: only you see yours
+    try {
+        if (RoomSyncAvailable()) RoomPropsTick();
+        else PlayerPropsTick();
+    } catch (...) {
+        g_wxSyncBroken = true;                       // don't retry every frame; your own effects still work
+        g_roomWx = -1;
+        g_roomTod = -1;
+        ym::log("clientdabell: room effects error, sharing off for this session");
+        Notify("Room Effects stopped working, yours still show for you");
+    }
+}
+static void RoomWxReset() {
+    g_wxSent = g_todSent = -1; g_roomWx = g_roomTod = -1; g_nextWxSend = 0;
+    g_nextWxRead = g_time + 1.0;                     // give Photon a moment to hand over the new room
+    g_chWx = SyncChan(); g_chTod = SyncChan();
+}
+
 static void WeatherTick(float dt) {
-    int mode = (g_wx >= 0 && g_wxSel[g_wx]) ? g_wx : -1;
-    int intensity = g_wxIntensity;
+    bool own = g_wx >= 0 && g_wxSel[g_wx];
+    int mode = own ? g_wx : g_roomWx;                          // yours wins; else the room's
+    int intensity = own ? g_wxIntensity : g_roomWxInt;
     Il2CppObject *head = g_head.get();
     if (mode < 0 || !head) { if (g_wxOn) WeatherOff(); return; }
     if (!EnsureWxRoot()) return;
@@ -2620,10 +2936,17 @@ static void WeatherTick(float dt) {
 }
 
 // ---- time of day: morning, afternoon, sunset, night ------------------------------------
-// Changes the scene's sky, light and fog on your own game, plus a sun or moon and stars of
-// our own (they are what you see for sure, even where the map's lighting is baked). Only
-// you see it; nothing is sent. The game's own values are saved the
-// first time and put back when you switch it off.
+// Yeeps maps have baked lighting, so changing the scene's lights alone barely shows. So the
+// time of day is drawn with objects of our own as well:
+//   - a sky dome: a big sphere around you, seen from the inside, in the sky's color
+//     (it covers the map's skybox; it is kept inside the camera's view distance)
+//   - a sun or moon and stars on the dome
+//   - a color filter: a small sphere around your eyes that multiplies everything you see by
+//     a color (darker and bluer at night, orange at sunset). It only draws if the shader
+//     takes a blend mode, so it can never black out your view.
+// The scene's light, ambient and fog are changed too where the map uses them. Your pick is
+// stored on the room like the weather (see RoomWxTick), so every ClientDaBell user sees the
+// same time of day. The game's own values are saved the first time and put back after.
 struct TodPreset {
     float az, el;                 // where the sun (or moon) is, in degrees
     Color light; float lightI;    // the scene's directional lights
@@ -2651,8 +2974,9 @@ static struct {
     Method<float> ambInt, fogStart, fogEnd, matGetFloat, lIntensity;
     Method<bool> fog, matHas;
     Method<void> setAmbMode, setAmbLight, setAmbInt, setFog, setFogMode, setFogColor, setFogStart, setFogEnd,
-                 matSetColorN, matSetFloat;
-    Method<Il2CppObject *> sky;
+                 matSetColorN, matSetFloat, matSetQueue, matKeyword;
+    Method<Il2CppObject *> sky, camMain;
+    Method<float> camFar;
 } TD;
 static void TodInit() {
     if (TD.init) return;
@@ -2675,6 +2999,13 @@ static void TodInit() {
         TD.matSetColorN = Overload(mat, "SetColor", {"System.String", "UnityEngine.Color"});
         TD.matGetFloat = Overload(mat, "GetFloat", {"System.String"});
         TD.matSetFloat = Overload(mat, "SetFloat", {"System.String", "System.Single"});
+        TD.matSetQueue = mat.GetMethod("set_renderQueue", 1);
+        TD.matKeyword = Overload(mat, "EnableKeyword", {"System.String"});
+    }
+    Class cam("UnityEngine", "Camera");
+    if (cam.IsValid()) {
+        TD.camMain = cam.GetMethod("get_main", 0);
+        TD.camFar = cam.GetMethod("get_farClipPlane", 0);
     }
     if (light.IsValid()) {
         LightMethods(light);
@@ -2687,6 +3018,8 @@ static void TodInit() {
             TD.lType.IsValid(), g_lightIntensity.IsValid());
 }
 
+static Il2CppObject *StrArg(const char *s) { return (Il2CppObject *)CreateMonoString(s); }
+
 // What the scene had before we changed it.
 static struct {
     bool saved = false;
@@ -2695,10 +3028,20 @@ static struct {
     Ref light[kMaxTodLights]; Color lightC[kMaxTodLights]; float lightI[kMaxTodLights]; Quaternion lightR[kMaxTodLights];
     int lights = 0;
 } TS;
-static Ref g_todRoot, g_todBall, g_todStar[kStars], g_todOwnLight;
+static Ref g_todRoot, g_todBall, g_todStar[kStars], g_todOwnLight, g_todDome, g_todTint;
 static Vector3 g_starDir[kStars];
 static int g_todShown = -1;
 static double g_nextTodApply = 0;
+static float g_todR = 250;                     // sky dome radius
+static bool g_todSceneBroken = false;          // the scene's lights/fog can't be changed here: our own sky still works
+// The color filter for each time of day (multiplied with everything you see). White = none.
+static const Color kTodTint[4] = {Color(1.0f, 0.94f, 0.86f, 1), Color(1, 1, 1, 1), Color(1.0f, 0.70f, 0.52f, 1),
+                                  Color(0.30f, 0.34f, 0.55f, 1)};
+static Il2CppObject *MatOf(Il2CppObject *go) {
+    Il2CppObject *r = Alive(go) ? G.goGetComponent[go](G.tRenderer) : nullptr;
+    return r ? G.rendererGetMaterial[r]() : nullptr;
+}
+static bool MatHas(Il2CppObject *m, const char *prop) { return m && TD.matHas.IsValid() && TD.matHas[m](StrArg(prop)); }
 
 static void TodPicked() {
     int picked = -1;
@@ -2710,7 +3053,6 @@ static Vector3 SkyDir(float azDeg, float elDeg) {
     float az = azDeg * 0.0174533f, el = elDeg * 0.0174533f;
     return Vector3(cosf(el) * cosf(az), sinf(el), cosf(el) * sinf(az));
 }
-static Il2CppObject *StrArg(const char *s) { return (Il2CppObject *)CreateMonoString(s); }
 
 static void TodSave() {
     if (TS.saved) return;
@@ -2800,6 +3142,50 @@ static void EnsureTodObjects() {
         G.trSetLocalScale[t](Vector3(size, size, size));
         g_todStar[i].set(st);
     }
+    // How far the camera can see: the dome has to sit inside that or it isn't drawn.
+    Il2CppObject *cam = TD.camMain.IsValid() ? TD.camMain() : nullptr;
+    float far = Alive(cam) && TD.camFar.IsValid() ? TD.camFar[cam]() : 0.0f;
+    g_todR = far > 1.0f ? std::max(60.0f, std::min(300.0f, far * 0.85f)) : 250.0f;
+    // Sky dome: the URP shader's _Cull set to Front draws the inside of the sphere.
+    if (Il2CppObject *d = Prim(0, Color(1, 1, 1, 1), false)) {
+        Il2CppObject *m = MatOf(d);
+        if (MatHas(m, "_Cull") && TD.matSetFloat.IsValid()) {
+            TD.matSetFloat[m](StrArg("_Cull"), 1.0f);              // 1 = Front: we see the inside
+            Il2CppObject *dt = Tr(d);
+            G.trSetParent[dt](rt, false);
+            G.trSetLocalPosition[dt](Vector3(0, 0, 0));
+            G.trSetLocalScale[dt](Vector3(g_todR * 2, g_todR * 2, g_todR * 2));
+            g_todDome.set(d);
+        } else { G.destroy(d); ym::log("clientdabell: time of day: no sky dome (shader has no _Cull)"); }
+    }
+    // Color filter around your eyes: multiply blend (result = what's behind * our color), so
+    // its alpha doesn't matter. Only made when the shader takes the blend settings.
+    Il2CppObject *eyes = Alive(cam) ? G.compTransform[cam]() : g_head.get();
+    if (eyes) if (Il2CppObject *f = Prim(0, Color(1, 1, 1, 1), false)) {
+        Il2CppObject *m = MatOf(f);
+        if (MatHas(m, "_SrcBlend") && MatHas(m, "_DstBlend") && MatHas(m, "_Cull") && MatHas(m, "_ZWrite") &&
+            TD.matSetFloat.IsValid() && TD.matSetQueue.IsValid()) {
+            auto F = [&](const char *n, float v) { if (MatHas(m, n)) TD.matSetFloat[m](StrArg(n), v); };
+            F("_Surface", 1);       // transparent
+            F("_Blend", 3);         // multiply
+            F("_SrcBlend", 2);      // DstColor
+            F("_DstBlend", 0);      // Zero
+            F("_SrcBlendAlpha", 0);
+            F("_DstBlendAlpha", 1);
+            F("_ZWrite", 0);
+            F("_Cull", 0);          // both sides
+            if (TD.matKeyword.IsValid()) TD.matKeyword[m](StrArg("_SURFACE_TYPE_TRANSPARENT"));
+            TD.matSetQueue[m](4000);   // after everything else
+            Il2CppObject *ft = Tr(f);
+            G.trSetParent[ft](eyes, false);
+            G.trSetLocalPosition[ft](Vector3(0, 0, 0));
+            G.trSetLocalScale[ft](Vector3(0.5f, 0.5f, 0.5f));
+            G.goSetActive[f](false);
+            g_todTint.set(f);
+        } else { G.destroy(f); ym::log("clientdabell: time of day: no color filter (shader has no blend settings)"); }
+    }
+    ym::log("clientdabell: time of day objects: far=%.0f dome=%d (r=%.0f) filter=%d", far, Alive(g_todDome.get()) ? 1 : 0,
+            g_todR, Alive(g_todTint.get()) ? 1 : 0);
     G.goSetActive[root](false);
 }
 static void TodApply(int tod) {
@@ -2850,32 +3236,47 @@ static void TodOff() {
     if (g_todShown < 0) return;
     g_todShown = -1;
     Show(g_todRoot, false);
-    TodRestore(true);
+    Show(g_todTint, false);
+    try { TodRestore(true); } catch (...) { g_todSceneBroken = true; }
 }
 static void TodReset() {                                           // room change
     Il2CppObject *sky = TD.sky.IsValid() ? TD.sky() : nullptr;
     TodRestore(TS.saved && sky && sky == TS.sky.get());            // same scene still: put everything back
     Kill(g_todRoot);
-    g_todBall.clear(); g_todOwnLight.clear();
+    Kill(g_todTint);
+    g_todBall.clear(); g_todOwnLight.clear(); g_todDome.clear();
     for (auto &s : g_todStar) s.clear();
     g_todShown = -1;
     g_nextTodApply = 0;
+    g_todSceneBroken = false;                                      // new map: try its lights again
 }
 static void TodTick() {
-    int tod = (g_tod >= 0 && g_todSel[g_tod]) ? g_tod : -1;
+    bool own = g_tod >= 0 && g_todSel[g_tod];
+    int tod = own ? g_tod : g_roomTod;
     Il2CppObject *head = g_head.get();
     if (tod < 0 || !head) { TodOff(); return; }
     TodInit();
-    TodSave();
+    if (!g_todSceneBroken) {
+        try { TodSave(); }
+        catch (...) { g_todSceneBroken = true; ym::log("clientdabell: time of day: scene lights can't be changed, using our own sky only"); }
+    }
     EnsureTodObjects();
     const TodPreset &p = kTod[tod];
     if (tod != g_todShown) {                                       // new pick: restyle the sky objects
         g_todShown = tod;
         g_nextTodApply = 0;
         Show(g_todRoot, true);
+        if (Alive(g_todDome.get())) SetColor(g_todDome.get(), p.fog ? p.fogC : p.sky);
+        Il2CppObject *f = g_todTint.get();
+        if (Alive(f)) {
+            Color c = kTodTint[tod];
+            bool on = c.r < 0.99f || c.g < 0.99f || c.b < 0.99f;
+            if (on) SetColor(f, c);
+            G.goSetActive[f](on);
+        }
         Il2CppObject *ball = g_todBall.get();
         if (Alive(ball)) {
-            float dist = p.moon ? 34.0f : 120.0f;
+            float dist = std::min(p.moon ? 34.0f : 120.0f, g_todR * 0.6f);
             Il2CppObject *bt = Tr(ball);
             G.trSetLocalPosition[bt](SkyDir(p.az, p.el) * dist);
             G.trSetLocalScale[bt](Vector3(p.ballSize, p.ballSize, p.ballSize));
@@ -2885,9 +3286,10 @@ static void TodTick() {
     }
     Il2CppObject *root = g_todRoot.get();
     if (Alive(root)) G.trSetPosition[Tr(root)](G.trGetPosition[head]());   // the sky follows you
-    if (g_time >= g_nextTodApply) {                                // again now and then, in case the game resets it
+    if (g_time >= g_nextTodApply && !g_todSceneBroken) {          // again now and then, in case the game resets it
         g_nextTodApply = g_time + 0.5;
-        TodApply(tod);
+        try { TodApply(tod); }
+        catch (...) { g_todSceneBroken = true; ym::log("clientdabell: time of day: scene lights can't be changed, using our own sky only"); }
     }
 }
 
@@ -3316,6 +3718,7 @@ static void OnRoomChange() {
     g_gunLine.clear();
     WeatherReset();
     try { TodReset(); } catch (...) {}
+    RoomWxReset();
     OverpoweredReset();
     if (g_noclipOn && g_player.get()) {           // leaving the room mid-noclip: put things back
         Buttons none;                             // trigger "released"
@@ -3374,10 +3777,11 @@ static void OnUpdate(float dt) {
     catch (...) { g_itemQueue.clear(); ym::log("clientdabell: item code error"); }
     try { LoadTick(); SoundTick(); }
     catch (...) { AbortLoad(); ym::log("clientdabell: song loading error"); }
+    RoomWxTick();
     try { WeatherTick(dt); }
     catch (...) { WeatherOff(); g_wx = -1; for (bool &b : g_wxSel) b = false; ym::log("clientdabell: effects error, turned off"); }
     try { TodTick(); }
-    catch (...) { g_tod = -1; for (bool &b : g_todSel) b = false; try { TodOff(); } catch (...) {} ym::log("clientdabell: time of day error, turned off"); }
+    catch (...) { g_tod = -1; for (bool &b : g_todSel) b = false; try { TodOff(); } catch (...) {} ym::log("clientdabell: time of day error, turned off"); Notify("Time of day error, turned off"); }
     try { OverpoweredTick(in, dt); }
     catch (...) {
         for (auto &it : g_items) if (it.cat == OVERPOWERED && it.kind == TOGGLE) *it.flag = false;
